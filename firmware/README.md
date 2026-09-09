@@ -54,8 +54,7 @@ bash scripts/build_firmware.sh m3_decD_deep_full
 ```
 
 Requirements: [Pico SDK](https://github.com/raspberrypi/pico-sdk) 2.2.0
-(+ [pico-extras](https://github.com/raspberrypi/pico-extras) for the VGA
-paths only — neither the headless nor the DVI build needs it),
+(+ [pico-extras](https://github.com/raspberrypi/pico-extras) for VGA,
 `arm-none-eabi-gcc`, cmake. Point
 `PICO_SDK_PATH` / `PICO_EXTRAS_PATH` at your copies. The UF2 lands in
 `uf2/pico_faces_<model>.uf2`.

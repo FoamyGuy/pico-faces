@@ -78,8 +78,7 @@ const int16_t *rf_z_state(void);
 #define CMD_NOP (0xfu << 12)
 
 /* RGB332 in a byte: [7:5]=R [4:2]=G [1:0]=B, 4 px per 32-bit FIFO word.
- * NBITS is (width - 1); ROT brings each channel's field up to bit 31..
- * (§1.5 verified these on hardware.) */
+ * NBITS is (width - 1); ROT brings each channel's field up to bit 31. */
 #define EXPAND_TMDS_RGB332                                                 \
     (2u << HSTX_CTRL_EXPAND_TMDS_L2_NBITS_LSB |                            \
      0u << HSTX_CTRL_EXPAND_TMDS_L2_ROT_LSB |                              \
@@ -271,7 +270,7 @@ static void video_start(void) {
                         5u << HSTX_CTRL_CSR_N_SHIFTS_LSB |
                         2u << HSTX_CTRL_CSR_SHIFT_LSB | HSTX_CTRL_CSR_EN_BITS;
 
-    /* §1.3: Fruit Jam runs CK, D0, D1, D2 in pin order from GP12 with the
+    /* Fruit Jam runs CK, D0, D1, D2 in pin order from GP12 with the
      * negative leg on the even pin. */
     hstx_ctrl_hw->bit[0] = HSTX_CTRL_BIT0_CLK_BITS | HSTX_CTRL_BIT0_INV_BITS;
     hstx_ctrl_hw->bit[1] = HSTX_CTRL_BIT0_CLK_BITS;
@@ -324,7 +323,7 @@ uint32_t rf_dvi_frame_rate_mhz(uint32_t ms) {
 }
 
 /* The expander can come up desynced, and when it does it never
- * recovers - the only cure is to tear the pipeline down and try again.
+ * recovers. The only cure is to tear the pipeline down and try again.
  * Returns the attempt that worked, or -1. */
 int rf_dvi_bringup_tries;
 static int video_start_checked(void) {

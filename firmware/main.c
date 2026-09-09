@@ -79,8 +79,7 @@ int main(void) {
     /* Must come after set_sys_clock_khz(): the SDK's runtime init leaves
      * clk_hstx glued undivided to clk_sys, and retuning clk_sys neither
      * re-divides it nor updates its recorded frequency. Take the actual
-     * clk_sys rather than RF_SYS_KHZ so the divider is computed from what
-     * the PLL really landed on. */
+     * clk_sys rather than RF_SYS_KHZ. */
     clock_configure(clk_hstx, 0, CLOCKS_CLK_HSTX_CTRL_AUXSRC_VALUE_CLK_SYS,
                     clock_get_hz(clk_sys), RF_HSTX_KHZ * 1000u);
 #endif

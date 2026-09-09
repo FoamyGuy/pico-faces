@@ -6,14 +6,13 @@ set(PICO_PLATFORM rp2350-arm-s CACHE STRING "")
 # RF_VGA=2 (default): interrupt-free scanout (vga_noirq.c) - static DMA
 # rings feeding scanvideo's PIO programs; zero display IRQs/CPU.
 # RF_VGA=1: the original scanvideo path (IRQ-driven, kept as fallback).
-# RF_VGA=0: headless (USB-CDC only) - no display, no pico-extras needed.
+# RF_VGA=0: headless (USB-CDC only), no display, no pico-extras needed.
 if(NOT DEFINED RF_VGA)
     set(RF_VGA 2)
 endif()
 
 # RF_DVI=1: DVI over HSTX (firmware/dvi_hstx.c), for the Adafruit Fruit Jam
-# Needs -DPICO_BOARD=adafruit_fruit_jam: the HSTX pin map is
-# the board's, and no other board here has one.
+# Needs -DPICO_BOARD=adafruit_fruit_jam
 if(NOT DEFINED RF_DVI)
     set(RF_DVI 0)
 endif()
@@ -24,13 +23,12 @@ if(RF_DVI AND RF_VGA)
 endif()
 if(RF_DVI AND NOT PICO_BOARD STREQUAL "adafruit_fruit_jam")
     message(FATAL_ERROR
-        "RF_DVI=1 needs -DPICO_BOARD=adafruit_fruit_jam (got '${PICO_BOARD}'): "
-        "dvi_hstx.c uses that board's HSTX pin map and DVI pair polarity.")
+        "RF_DVI=1 needs -DPICO_BOARD=adafruit_fruit_jam (got '${PICO_BOARD}')")
 endif()
 
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
-# pico-extras only supplies the VGA/scanvideo path; a headless or, DVI/HSTX
-# build must not require it
+# pico-extras only supplies the VGA/scanvideo path; headless or, DVI/HSTX
+# build doesn't require it
 if(RF_VGA)
     include($ENV{PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 endif()
@@ -119,8 +117,8 @@ if(RF_VGA EQUAL 2)
         target_compile_definitions(pico_faces PRIVATE RF_VGA_TEST=1)
     endif()
 elseif(RF_DVI)
-    # DVI over HSTX: no PIO, no scanvideo, no pico-extras - the TMDS encoding
-    # is in hardware and the whole frame is a static DMA command list.
+    # DVI over HSTX. the TMDS encoding is in hardware and the
+    # whole frame is a static DMA command list.
     target_sources(pico_faces PRIVATE dvi_hstx.c)
     target_link_libraries(pico_faces hardware_dma)
     if(RF_VGA_TEST) # boot test pattern through the fb path (debug aid)
