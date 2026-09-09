@@ -126,7 +126,7 @@ static bool have_image; /* rf_img holds a face, so a redraw is meaningful */
  * the progress bar, which has nothing else to say between generations.
  */
 #ifndef RF_AUTO_MS
-#define RF_AUTO_MS 6500
+#define RF_AUTO_MS 15000
 #endif
 static bool auto_mode;
 static absolute_time_t auto_due; /* when the next automatic face is due */

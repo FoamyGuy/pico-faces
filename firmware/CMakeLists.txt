@@ -172,7 +172,7 @@ if(RF_VGA EQUAL 2)
 elseif(RF_DVI)
     # DVI over HSTX. the TMDS encoding is in hardware and the
     # whole frame is a static DMA command list.
-    target_sources(pico_faces PRIVATE dvi_hstx.c)
+    target_sources(pico_faces PRIVATE dvi_hstx.c color_grid.c)
     target_link_libraries(pico_faces hardware_dma)
     target_compile_definitions(pico_faces PRIVATE
         RF_COLOR_GRID=${RF_COLOR_GRID} RF_PANEL=${RF_PANEL})
