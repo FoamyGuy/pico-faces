@@ -1,5 +1,11 @@
 # viewer/
 
+`view_serial.py` — PC-side serial client for a flashed Pico 2.
+`color_grid_tune.py` — designs the palettes for the firmware's 2x2 color grid
+(see [the section below](#color_grid_tunepy)).
+
+## view_serial.py
+
 PC-side serial client for a flashed Pico 2. Requests a generation over
 USB-CDC (virtual com port), prints the device-reported CRC and timing, saves the frame as a
 PNG, and can byte-compare it against a released golden.
@@ -46,3 +52,59 @@ the FFHQ facial-attribute annotations
 Conditioning is soft: classes steer identity/expression statistics, and
 higher `--cfg` values enforce them (and overall structure) more strongly.
 `w=4` is the balanced default; `w=8` is the strongest, most-typical look.
+
+# color_grid_tune.py
+
+On a `RF_COLOR_GRID` build (the default for the Fruit Jam / DVI firmware) the
+display shows the one generated face four times, each panel through its own
+palette. Reflashing to compare two pinks is miserable, so this script runs the
+firmware's filter on the host — the same integer luminance, the same histogram
+band edges, the same softening, and optionally the same RGB332
+Floyd–Steinberg the panel dithers with. Its output is **byte-identical** to
+what `firmware/color_grid.c` computes, so what you preview is what you get.
+
+```
+# grab one face, then iterate on it offline (no board needed after this)
+python viewer/view_serial.py --port /dev/ttyACM0 --seed 3
+python viewer/color_grid_tune.py --image out/seed_3.png --show
+
+# look at all the built-in sets at once, or sweep one knob
+python viewer/color_grid_tune.py --image out/seed_3.png --sheet --show
+python viewer/color_grid_tune.py --image out/seed_3.png --sweep soft --show
+python viewer/color_grid_tune.py --image out/seed_3.png --sweep q --show
+
+# random candidates; it prints each one as pasteable --palette lines
+python viewer/color_grid_tune.py --image out/seed_3.png --random 12 --show
+
+# bake the winner into firmware/color_grid.c, or try it on a running board first
+python viewer/color_grid_tune.py --set palette2 --emit
+python viewer/color_grid_tune.py --set palette2 --push --port /dev/ttyACM0
+```
+
+A golden works as a source too (`--image checkpoints/<model>/goldens/golden_3.rgb`),
+and `--port` without `--image` generates a fresh face first.
+
+| flag | meaning |
+|---|---|
+| `--image` | source face: a PNG, or a raw `.rgb`/`.gray` |
+| `--port` | generate a fresh face from a board instead (also used by `--push`) |
+| `--set` | named palette set: `palette1`, `palette2`, `palette3`, `palette4`, `palette5` |
+| `--palette` | one panel's colours, darkest first; repeat 4x to replace `--set` |
+| `--soft` | 0 = flat posterise … 255 = smooth gradient map (default 64) |
+| `--q` | band split quantiles, percent of pixels, ascending (default `18,46,76`) |
+| `--panel` | `RF_PANEL`: grid cell size, 192 or 216 (default 192) |
+| `--sheet` / `--sweep` / `--random` | render many candidates side by side |
+| `--dither` / `--no-dither` | simulate the panel's RGB332 dither; on by default for a single render, off for multi-cell output (it is a Python pixel loop) |
+| `--emit` | rewrite the generated block in `firmware/color_grid.c` |
+| `--push` | send the palette over `L`/`W` to the board on `--port` and redraw |
+
+Adding a set is four rows of four hex colours in `SETS` at the top of the
+script. Darkest band first: the first colour is the ink that draws the eyes
+and hairline, the middle two carry hair and skin, the last is the highlight.
+
+The firmware carries the same sets (`color_grid_sets[]` in `firmware/color_grid.c`),
+so a Fruit Jam can cycle them from button 2 or the `S [n]` serial command with
+no host running. Adding one to `SETS` here does not put it on the device —
+paste it into that table too.
+
+Needs `numpy` + `pillow` (both in [requirements.txt](../requirements.txt)).

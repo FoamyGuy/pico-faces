@@ -21,14 +21,56 @@ if(RF_DVI AND RF_VGA)
         "RF_DVI=1 and RF_VGA=${RF_VGA} are mutually exclusive: they are two "
         "scanouts for one framebuffer. Pass -DRF_VGA=0 with -DRF_DVI=1.")
 endif()
+# RF_COLOR_GRID=1 (default on the DVI path): show the one generated face four
+# times in a 2x2 grid, each panel recoloured by firmware/color_grid.c.
+# RF_COLOR_GRID=0 restores the original single face filling the band.
+# RF_PANEL is the size of one grid cell.
+if(NOT DEFINED RF_COLOR_GRID)
+    set(RF_COLOR_GRID 1)
+endif()
+if(NOT DEFINED RF_PANEL)
+    set(RF_PANEL 192)
+endif()
+
+# RF_BUTTONS=1 (default on the Fruit Jam): drive the firmware from the three
+# built-in buttons - GP0 new face, GP4 next palette set, GP5 next
+# generation preset, and holding GP0 or GP4 down switches a mode (automatic
+# refresh, and the color grid).
+if(NOT DEFINED RF_BUTTONS)
+    if(PICO_BOARD STREQUAL "adafruit_fruit_jam")
+        set(RF_BUTTONS 1)
+    else()
+        set(RF_BUTTONS 0)
+    endif()
+endif()
+if(NOT DEFINED RF_AUTOGEN)
+    set(RF_AUTOGEN ${RF_BUTTONS})
+endif()
+
+# RF_RANDOM_SEED=1 (default): pick the seed at random, so a board shows a
+# different run of faces every time it is powered on. The entropy is the
+# RP2350's hardware TRNG plus its per-boot random word (pico_rand).
+# RF_RANDOM_SEED=0 boots deterministic instead: the seed starts at
+# RF_SEED0 and each new face is the next one up, so the same board draws the
+# same stream in the same order every time. It is only the power-on default -
+# "R 0"/"R 1" over USB switches modes on a running board, and "G <seed>" sets
+# a specific seed either way.
+if(NOT DEFINED RF_RANDOM_SEED)
+    set(RF_RANDOM_SEED 1)
+endif()
+if(NOT DEFINED RF_SEED0)
+    set(RF_SEED0 1)
+endif()
+
 if(RF_DVI AND NOT PICO_BOARD STREQUAL "adafruit_fruit_jam")
     message(FATAL_ERROR
-        "RF_DVI=1 needs -DPICO_BOARD=adafruit_fruit_jam (got '${PICO_BOARD}')")
+        "RF_DVI=1 needs -DPICO_BOARD=adafruit_fruit_jam (got '${PICO_BOARD}'): "
+        "dvi_hstx.c uses that board's HSTX pin map and DVI pair polarity.")
 endif()
 
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
-# pico-extras only supplies the VGA/scanvideo path; headless or, DVI/HSTX
-# build doesn't require it
+# pico-extras only supplies the VGA/scanvideo path; a headless or, DVI/HSTX
+# build must not require it
 if(RF_VGA)
     include($ENV{PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 endif()
@@ -87,10 +129,21 @@ if(RF_DVI)
     endif()
 endif()
 target_compile_definitions(pico_faces PRIVATE
-    RF_SYS_KHZ=${RF_SYS_KHZ} RF_DVI=${RF_DVI} RF_HOT_IN_RAM=1)
+    RF_SYS_KHZ=${RF_SYS_KHZ} RF_DVI=${RF_DVI} RF_HOT_IN_RAM=1
+    RF_BUTTONS=${RF_BUTTONS} RF_AUTOGEN=${RF_AUTOGEN}
+    RF_RANDOM_SEED=${RF_RANDOM_SEED} RF_SEED0=${RF_SEED0})
+if(RF_BUTTONS)
+    target_sources(pico_faces PRIVATE buttons.c)
+endif()
+foreach(btn RF_BTN1_PIN RF_BTN2_PIN RF_BTN3_PIN RF_BTN_ACTIVE_LOW
+            RF_BTN_LONG_MS RF_AUTO_MS)
+    if(DEFINED ${btn})
+        target_compile_definitions(pico_faces PRIVATE ${btn}=${${btn}})
+    endif()
+endforeach()
 
 target_link_libraries(pico_faces pico_stdlib pico_multicore hardware_vreg
-    hardware_clocks)
+    hardware_clocks pico_rand)
 if(RF_STAGE_DMA)
     target_sources(pico_faces PRIVATE stage.c)
     target_link_libraries(pico_faces hardware_dma)
@@ -121,6 +174,8 @@ elseif(RF_DVI)
     # whole frame is a static DMA command list.
     target_sources(pico_faces PRIVATE dvi_hstx.c)
     target_link_libraries(pico_faces hardware_dma)
+    target_compile_definitions(pico_faces PRIVATE
+        RF_COLOR_GRID=${RF_COLOR_GRID} RF_PANEL=${RF_PANEL})
     if(RF_VGA_TEST) # boot test pattern through the fb path (debug aid)
         target_compile_definitions(pico_faces PRIVATE RF_VGA_TEST=1)
     endif()

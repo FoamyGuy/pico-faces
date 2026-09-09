@@ -18,6 +18,39 @@ import sys
 import serial
 
 
+def capture(port, seed, steps=4, cls=None, cfg=None, timeout=120):
+    """Ask a flashed board for one generation. Returns (img_bytes, w, h, ch, cond, ms)."""
+    s = serial.Serial(port, 115200, timeout=timeout)
+    s.reset_input_buffer()
+    cmd = f"G {seed} {steps}"
+    if cls is not None:
+        cmd += f" {cls}"
+        if cfg is not None:
+            cmd += f" {cfg}"
+    s.write((cmd + "\n").encode())
+
+    # sync on magic
+    window = b""
+    while window not in (b"RFIM", b"RFI2"):
+        b = s.read(1)
+        if not b:
+            raise TimeoutError("timeout waiting for image "
+                               "(generation may take a while)")
+        window = (window + b)[-4:]
+
+    if window == b"RFIM":  # legacy gray header
+        seed, w, h = struct.unpack("<IHH", s.read(8))
+        ch, cond = 1, 0
+    else:
+        seed, w, h, ch, cond = struct.unpack("<IHHHH", s.read(12))
+    img = s.read(w * h * ch)
+    crc, ms = struct.unpack("<II", s.read(8))
+    local_crc = binascii.crc32(img) & 0xFFFFFFFF
+    ok = "OK" if local_crc == crc else "CRC MISMATCH"
+    print(f"seed {seed} cls {cond}: {w}x{h}x{ch}, {ms} ms, crc {crc:08x} ({ok})")
+    return img, w, h, ch, cond, ms
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", required=True)
@@ -38,34 +71,13 @@ def main():
     ap.add_argument("--expect", help=".gray/.rgb file to byte-compare against")
     args = ap.parse_args()
 
-    s = serial.Serial(args.port, 115200, timeout=120)
-    s.reset_input_buffer()
-    cmd = f"G {args.seed} {args.steps}"
-    if args.cls is not None:
-        cmd += f" {args.cls}"
-        if args.cfg is not None:
-            cmd += f" {args.cfg}"
-    s.write((cmd + "\n").encode())
-
-    # sync on magic
-    window = b""
-    while window not in (b"RFIM", b"RFI2"):
-        b = s.read(1)
-        if not b:
-            print("timeout waiting for image (generation may take a while)")
-            sys.exit(1)
-        window = (window + b)[-4:]
-
-    if window == b"RFIM":  # legacy gray header
-        seed, w, h = struct.unpack("<IHH", s.read(8))
-        ch, cond = 1, 0
-    else:
-        seed, w, h, ch, cond = struct.unpack("<IHHHH", s.read(12))
-    img = s.read(w * h * ch)
-    crc, ms = struct.unpack("<II", s.read(8))
-    local_crc = binascii.crc32(img) & 0xFFFFFFFF
-    ok = "OK" if local_crc == crc else "CRC MISMATCH"
-    print(f"seed {seed} cls {cond}: {w}x{h}x{ch}, {ms} ms, crc {crc:08x} ({ok})")
+    try:
+        img, w, h, ch, cond, ms = capture(args.port, args.seed, args.steps,
+                                          args.cls, args.cfg)
+    except TimeoutError as e:
+        print(e)
+        sys.exit(1)
+    seed = args.seed
 
     os.makedirs(args.out, exist_ok=True)
     from PIL import Image

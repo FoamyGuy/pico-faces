@@ -17,6 +17,7 @@
  * display<->preview is one atomic 32-bit READ_ADDR store per slot.
  */
 #include <assert.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "hardware/clocks.h"
@@ -30,22 +31,58 @@
 
 #include "rf_model.h"
 #include "rf_ops.h"
+#include "color_grid.h"
 
 extern uint8_t rf_img[RF_IMG_HW * RF_IMG_HW * RF_IMG_CH];
 extern volatile uint8_t rf_progress;
 extern volatile uint8_t rf_progress_total;
 const int16_t *rf_z_state(void);
 
-/* ---- screen layout (matches vga_noirq.c) -------------------------------- */
-#define IMG_X0 128
-#define IMG_W 384
-#define IMG_H 384
-#define IMG_Y0 48
-#define BAR_Y0 450
-#define BAR_H 12
+/* ---- screen layout ------------------------------------------------------
+ * Everything below is derived from RF_PANEL (color_grid.h), which is the size of
+ * one cell of the 2x2 grid; the band is two of those square, centred, with
+ * the progress bar centred in what is left underneath. RF_PANEL 192 is the
+ * original 384-square band pixel for pixel (X0 128, Y0 48, bar at 450);
+ * RF_PANEL 216 gives a 432-square band (X0 104, Y0 24, bar at 462).
+ */
 #define H_ACTIVE 640
 #define V_ACTIVE 480
-#define IMG_X1 (H_ACTIVE - IMG_X0 - IMG_W) /* right margin, 128 */
+#define IMG_W (2 * RF_PANEL)
+#define IMG_H (2 * RF_PANEL)
+#define IMG_X0 ((H_ACTIVE - IMG_W) / 2)
+#define IMG_Y0 ((V_ACTIVE - IMG_H) / 2)
+#define IMG_X1 (H_ACTIVE - IMG_X0 - IMG_W) /* right margin */
+#define BAR_H 12
+#define BAR_Y0 (IMG_Y0 + IMG_H + ((V_ACTIVE - IMG_H) / 2 - BAR_H) / 2)
+
+/* Readout: which of the generation presets button 3 is on, as "n/total" in
+ * the strip under the progress bar. RF_PANEL 216 leaves nothing there (the
+ * bar takes the whole 24px), so it falls back to the clear strip above the
+ * band - the only other one. */
+#define GLYPH_W 5
+#define GLYPH_H 7
+#define TXT_SCALE 2
+#define TXT_CHARS 5 /* "12/16" is the widest this can need */
+#define TXT_H (GLYPH_H * TXT_SCALE)
+#define TXT_ADV ((GLYPH_W + 1) * TXT_SCALE)
+#define TXT_W (TXT_CHARS * TXT_ADV)
+#define TXT_X0 IMG_X0 /* lined up with the band, not floating in the corner */
+#define TXT_BOT (V_ACTIVE - (BAR_Y0 + BAR_H)) /* strip under the bar */
+#if TXT_BOT >= TXT_H
+#define TXT_Y0 (BAR_Y0 + BAR_H + (TXT_BOT - TXT_H) / 2)
+#else
+#define TXT_Y0 ((IMG_Y0 - TXT_H) / 2)
+#endif
+
+static_assert(IMG_W % 4 == 0, "a scanline row packs 4 pixels per word");
+static_assert(IMG_H % RF_ZHW == 0, "preview rows must tile the band evenly");
+static_assert(BAR_Y0 + BAR_H <= V_ACTIVE, "no room under the band for the bar");
+static_assert(TXT_W % 4 == 0, "a readout row packs 4 pixels per word");
+static_assert(TXT_X0 + TXT_W <= H_ACTIVE, "the readout runs off the right");
+static_assert(TXT_Y0 >= 0 && TXT_Y0 + TXT_H <= V_ACTIVE,
+              "no clear strip for the readout");
+static_assert(TXT_Y0 >= BAR_Y0 + BAR_H || TXT_Y0 + TXT_H <= IMG_Y0,
+              "the readout lands on the band or the bar");
 
 /* ---- DVI timing: (30 MHz pixel clock, 952x525, 60.0 Hz) ------
  * clk_hstx = 150 MHz is set in main.c under RF_DVI; HSTX is DDR and spends
@@ -78,7 +115,8 @@ const int16_t *rf_z_state(void);
 #define CMD_NOP (0xfu << 12)
 
 /* RGB332 in a byte: [7:5]=R [4:2]=G [1:0]=B, 4 px per 32-bit FIFO word.
- * NBITS is (width - 1); ROT brings each channel's field up to bit 31. */
+ * NBITS is (width - 1); ROT brings each channel's field up to bit 31..
+ * (§1.5 verified these on hardware.) */
 #define EXPAND_TMDS_RGB332                                                 \
     (2u << HSTX_CTRL_EXPAND_TMDS_L2_NBITS_LSB |                            \
      0u << HSTX_CTRL_EXPAND_TMDS_L2_ROT_LSB |                              \
@@ -98,6 +136,7 @@ const int16_t *rf_z_state(void);
 #define BG RGB332(0, 0, 1)     /* (0,0,85)     */
 #define BAR_OFF RGB332(1, 1, 1) /* (36,36,85)  */
 #define BAR_ON RGB332(2, 6, 1)  /* (73,219,85) */
+#define TXT_FG RGB332(4, 4, 2)  /* (146,146,170) - legible, not shouty */
 
 /* ---- scanline buffers ---------------------------------------------------
  * One DMA block is one whole scanline, so each image row carries its own
@@ -106,12 +145,12 @@ const int16_t *rf_z_state(void);
  *   [0..7]    front porch / hsync / back porch  (RAW_REPEAT + sync word)
  *   [8..9]    TMDS_REPEAT | IMG_X0, BG          left margin
  *   [10]      TMDS | IMG_W                      the band header
- *   [11..106] 96 words of RGB332 pixels, 4 px each, leftmost in byte 0
- *   [107..108] TMDS_REPEAT | IMG_X1, BG         right margin
+ *   [11..]    IMG_W/4 words of RGB332 pixels, 4 px each, leftmost in byte 0
+ *   [..+1,+2] TMDS_REPEAT | IMG_X1, BG          right margin
  */
 #define ROW_PX_OFF 11
-#define ROW_PX_WORDS (IMG_W / 4) /* 96 */
-#define ROW_WORDS (ROW_PX_OFF + ROW_PX_WORDS + 2) /* 109 */
+#define ROW_PX_WORDS (IMG_W / 4)                  /* 96 at RF_PANEL 192 */
+#define ROW_WORDS (ROW_PX_OFF + ROW_PX_WORDS + 2) /* 109 at RF_PANEL 192 */
 
 /* fb rows alias rf_arena, which is idle whenever an image is displayed */
 static_assert(IMG_H * ROW_WORDS * 4 <= (int)sizeof rf_arena,
@@ -123,13 +162,21 @@ static inline uint32_t *fb_row(int y) {
 /* Preview rows are static: they are live exactly when the arena is not.
  * 16 latent rows, each feeding PREV_SCALE scanline slots. */
 #define PREV_ROWS RF_ZHW
-#define PREV_SCALE (IMG_H / RF_ZHW) /* 24 */
+#define PREV_SCALE (IMG_H / RF_ZHW) /* 24 at RF_PANEL 192 */
 static uint32_t prev_row[PREV_ROWS][ROW_WORDS];
 
-/* full-width background line, and the progress-bar line (live) */
+/* full-width background line, and the progress-bar line (live, and so
+ * double-buffered - see bar_set()) */
 static uint32_t bg_line[10];
-static uint32_t bar_line[16];
+static uint32_t bar_line[2][16];
+static int bar_front; /* which of the two the command list points at */
 static uint32_t vblank_off[7], vblank_on[7];
+
+/* readout rows: the same shape as an image row, one per scanline of text */
+#define TXT_PX_OFF 11
+#define TXT_PX_WORDS (TXT_W / 4)
+#define TXT_WORDS (TXT_PX_OFF + TXT_PX_WORDS + 2)
+static uint32_t txt_line[TXT_H][TXT_WORDS];
 
 static void row_head(uint32_t *r) {
     r[0] = CMD_RAW_REPEAT | H_FRONT;
@@ -142,7 +189,7 @@ static void row_head(uint32_t *r) {
     r[7] = SYNC_V1_H1;
 }
 
-/* rewrite a row's commands; leaves the 96 pixel words alone */
+/* rewrite a row's commands; leaves the pixel words alone */
 static void row_frame(uint32_t *r) {
     row_head(r);
     r[8] = CMD_TMDS_REPEAT | IMG_X0;
@@ -175,32 +222,87 @@ static void build_lines(void) {
     bg_line[8] = CMD_TMDS_REPEAT | H_ACTIVE;
     bg_line[9] = RGB332_W(BG);
 
-    row_head(bar_line);
-    bar_line[8] = CMD_TMDS_REPEAT | IMG_X0;
-    bar_line[9] = RGB332_W(BG);
-    bar_line[10] = CMD_TMDS_REPEAT | 1; /* live: done   */
-    bar_line[11] = RGB332_W(BAR_ON);
-    bar_line[12] = CMD_TMDS_REPEAT | (IMG_W - 1); /* live: remaining */
-    bar_line[13] = RGB332_W(BAR_OFF);
-    bar_line[14] = CMD_TMDS_REPEAT | IMG_X1;
-    bar_line[15] = RGB332_W(BG);
+    /* both halves get the same fixed parts, so a swap only ever changes the
+     * four words in the middle */
+    for (int i = 0; i < 2; i++) {
+        uint32_t *b = bar_line[i];
+        row_head(b);
+        b[8] = CMD_TMDS_REPEAT | IMG_X0;
+        b[9] = RGB332_W(BG);
+        b[10] = CMD_TMDS_REPEAT | 1; /* live: done   */
+        b[11] = RGB332_W(BAR_ON);
+        b[12] = CMD_TMDS_REPEAT | (IMG_W - 1); /* live: remaining */
+        b[13] = RGB332_W(BAR_OFF);
+        b[14] = CMD_TMDS_REPEAT | IMG_X1;
+        b[15] = RGB332_W(BG);
+    }
 
     for (int y = 0; y < IMG_H; y++) row_frame(fb_row(y));
     for (int p = 0; p < PREV_ROWS; p++) row_frame(prev_row[p]);
+
+    for (int y = 0; y < TXT_H; y++) {
+        uint32_t *r = txt_line[y];
+        row_head(r);
+        r[8] = CMD_TMDS_REPEAT | TXT_X0;
+        r[9] = RGB332_W(BG);
+        r[10] = CMD_TMDS | TXT_W;
+        memset(r + TXT_PX_OFF, BG, TXT_W);
+        r[TXT_PX_OFF + TXT_PX_WORDS] =
+            CMD_TMDS_REPEAT | (H_ACTIVE - TXT_X0 - TXT_W);
+        r[TXT_PX_OFF + TXT_PX_WORDS + 1] = RGB332_W(BG);
+    }
 }
 
-static void bar_set(int done) {
-    uint32_t on = RGB332_W(BAR_ON), off = RGB332_W(BAR_OFF);
-    if (done < 0) { /* hidden */
-        on = off = RGB332_W(BG);
-        done = 1;
+/* ---- readout -------------------------------------------------------------
+ * Digits and '/', 5x7, bit 4 leftmost. Only the characters rf_dvi_readout()
+ * can produce are here; anything else draws as a blank cell. */
+static const uint8_t font5x7[11][GLYPH_H] = {
+    {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}, /* 0 */
+    {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e}, /* 1 */
+    {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, /* 2 */
+    {0x0e, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0e}, /* 3 */
+    {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, /* 4 */
+    {0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e}, /* 5 */
+    {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e}, /* 6 */
+    {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}, /* 7 */
+    {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}, /* 8 */
+    {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c}, /* 9 */
+    {0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10}, /* / */
+};
+
+/* Only the pixel bytes are touched, never a command word, so a redraw that
+ * races the scanout can at worst tear one frame of text. */
+void rf_dvi_readout(int n, int total) {
+    char str[TXT_CHARS + 1];
+    int len = 0;
+    /* "n/total", each part up to two digits; anything wider is clipped */
+    int parts[2] = {n, total};
+    for (int p = 0; p < 2 && len < TXT_CHARS; p++) {
+        int v = parts[p] < 0 ? 0 : parts[p] > 99 ? 99 : parts[p];
+        if (v >= 10 && len < TXT_CHARS) str[len++] = (char)('0' + v / 10);
+        if (len < TXT_CHARS) str[len++] = (char)('0' + v % 10);
+        if (p == 0 && len < TXT_CHARS) str[len++] = '/';
     }
-    if (done < 1) done = 1;
-    if (done > IMG_W - 1) done = IMG_W - 1;
-    bar_line[10] = CMD_TMDS_REPEAT | (uint32_t)done;
-    bar_line[11] = on;
-    bar_line[12] = CMD_TMDS_REPEAT | (uint32_t)(IMG_W - done);
-    bar_line[13] = off;
+    str[len] = 0;
+
+    for (int y = 0; y < TXT_H; y++)
+        memset(txt_line[y] + TXT_PX_OFF, BG, TXT_W);
+    for (int c = 0; c < len; c++) {
+        int g = str[c] == '/' ? 10 : str[c] - '0';
+        if (g < 0 || g > 10) continue;
+        for (int gy = 0; gy < GLYPH_H; gy++) {
+            uint8_t bits = font5x7[g][gy];
+            for (int gx = 0; gx < GLYPH_W; gx++) {
+                if (!(bits & (1u << (GLYPH_W - 1 - gx)))) continue;
+                for (int sy = 0; sy < TXT_SCALE; sy++)
+                    memset((uint8_t *)(txt_line[gy * TXT_SCALE + sy] +
+                                       TXT_PX_OFF) +
+                               c * TXT_ADV + gx * TXT_SCALE,
+                           TXT_FG, TXT_SCALE);
+            }
+        }
+    }
+    __dmb();
 }
 
 /* ---- DMA command list ---------------------------------------------------
@@ -215,9 +317,55 @@ typedef struct {
 #define N_CB (V_BLANK + V_ACTIVE + 1) /* 526 */
 static cb_t cblist[N_CB] __attribute__((aligned(16)));
 static uint16_t rowblk[IMG_H]; /* cblist index of each image-band line slot */
+static uint16_t barblk[BAR_H]; /* and of each progress-bar line slot */
 static const void *volatile rewind_src; /* holds &cblist[0] */
 
 static int ch_ctl, ch_dat;
+
+/* The bar's two runs must always add up to IMG_W: they are the middle of a
+ * scanline, and a line that emits the wrong number of pixels is a line of
+ * broken sync, which a monitor answers by dropping out for a moment. The
+ * scanout reads those words straight out of memory as it draws each of the
+ * BAR_H rows, spread over microseconds, so writing them in place means a
+ * frame can catch the new "done" with the old "remaining".
+ *
+ * So the bar is built where nothing is looking and swapped in the way the
+ * image band is: one aligned 32-bit READ_ADDR store per line slot, each
+ * keeping its transfer count, so the command list is valid at every instant.
+ * Mid-swap the bar's rows can be split across the two buffers for one frame,
+ * but every one of them is a whole, correctly sized line. */
+static void bar_set(int done) {
+    static int shown; /* what is on screen; 0 = nothing drawn yet */
+    if (done > IMG_W - 1) done = IMG_W - 1;
+    if (done >= 0 && done < 1) done = 1;
+    if (done < 0) done = -1; /* hidden */
+    if (done == shown) return;
+    shown = done;
+
+    uint32_t on = RGB332_W(BAR_ON), off = RGB332_W(BAR_OFF);
+    if (done < 0) {
+        on = off = RGB332_W(BG);
+        done = 1;
+    }
+    uint32_t *b = bar_line[bar_front ^ 1];
+    b[10] = CMD_TMDS_REPEAT | (uint32_t)done;
+    b[11] = on;
+    b[12] = CMD_TMDS_REPEAT | (uint32_t)(IMG_W - done);
+    b[13] = off;
+    __dmb(); /* the line before the pointer to it */
+    for (int k = 0; k < BAR_H; k++) cblist[barblk[k]].read = b;
+    bar_front ^= 1;
+}
+
+/* The bar as a general-purpose gauge, for whoever owns the screen between
+ * generations: num/den of the band's width, or den <= 0 to hide it again.
+ * main.c draws the automatic-refresh countdown with it; rf_step_hook() takes
+ * it back the moment a generation starts. */
+void rf_dvi_bar(int num, int den) {
+    /* 64-bit so a caller counting in milliseconds can name a long wait */
+    bar_set(den > 0 ? (int)((int64_t)num * IMG_W / den) : -1);
+    __dmb();
+}
 
 static void build_cblist(void) {
     uint32_t feed = (dma_channel_get_default_config(ch_dat).ctrl |
@@ -243,7 +391,11 @@ static void build_cblist(void) {
             rowblk[iy] = (uint16_t)n;
             cblist[n++] = (cb_t){fb_row(iy), fifo, ROW_WORDS, feed};
         } else if (ay >= BAR_Y0 && ay < BAR_Y0 + BAR_H) {
-            cblist[n++] = (cb_t){bar_line, fifo, count_of(bar_line), feed};
+            barblk[ay - BAR_Y0] = (uint16_t)n;
+            cblist[n++] =
+                (cb_t){bar_line[0], fifo, count_of(bar_line[0]), feed};
+        } else if (ay >= TXT_Y0 && ay < TXT_Y0 + TXT_H) {
+            cblist[n++] = (cb_t){txt_line[ay - TXT_Y0], fifo, TXT_WORDS, feed};
         } else {
             cblist[n++] = (cb_t){bg_line, fifo, count_of(bg_line), feed};
         }
@@ -270,7 +422,7 @@ static void video_start(void) {
                         5u << HSTX_CTRL_CSR_N_SHIFTS_LSB |
                         2u << HSTX_CTRL_CSR_SHIFT_LSB | HSTX_CTRL_CSR_EN_BITS;
 
-    /* Fruit Jam runs CK, D0, D1, D2 in pin order from GP12 with the
+    /* §1.3: Fruit Jam runs CK, D0, D1, D2 in pin order from GP12 with the
      * negative leg on the even pin. */
     hstx_ctrl_hw->bit[0] = HSTX_CTRL_BIT0_CLK_BITS | HSTX_CTRL_BIT0_INV_BITS;
     hstx_ctrl_hw->bit[1] = HSTX_CTRL_BIT0_CLK_BITS;
@@ -323,7 +475,7 @@ uint32_t rf_dvi_frame_rate_mhz(uint32_t ms) {
 }
 
 /* The expander can come up desynced, and when it does it never
- * recovers. The only cure is to tear the pipeline down and try again.
+ * recovers - the only cure is to tear the pipeline down and try again.
  * Returns the attempt that worked, or -1. */
 int rf_dvi_bringup_tries;
 static int video_start_checked(void) {
@@ -383,13 +535,34 @@ void rf_vga_invalidate(void) {
     __dmb();
 }
 
-/* Floyd-Steinberg the 128x128 decode (rf_img) into the fb, upscaled 3x to
- * 384, then switch the band back.*/
+/* Floyd-Steinberg the 128x128 decode (rf_img) into the fb, then switch the
+ * band back. Under RF_COLOR_GRID the same decode is drawn four times, once per
+ * RF_PANEL cell, each cell recoloured by color_grid.c; otherwise it is a single
+ * face scaled to the whole band (3x at RF_PANEL 192). Either way this is one
+ * pass over the band's pixels, so the grid costs nothing over the original.
+ *
+ * Which of the two it draws is rf_color_grid_on, read fresh here, so switching
+ * grid <-> single face is just this pass again over the face already in
+ * rf_img - nothing regenerates.
+ *
+ * Diffusing error across a panel seam would rain one palette's leftovers
+ * into the next panel's flat colours, so the seams reset the accumulator. */
 void rf_vga_dither(void) {
     static int16_t err[2][IMG_W + 2][RF_IMG_CH];
+    /* folds away on an RF_COLOR_GRID=0 build, which has no grid to switch to */
+    const bool grid = RF_COLOR_GRID && rf_color_grid_on;
+    if (grid) rf_color_grid_levels(rf_img);
     memset(err, 0, sizeof err);
     for (int y = 0; y < IMG_H; y++) {
-        const uint8_t *src = rf_img + (size_t)(y / 3) * RF_IMG_HW * RF_IMG_CH;
+        int qy = 0, sy;
+        if (grid) {
+            if (y == RF_PANEL) memset(err, 0, sizeof err); /* horizontal seam */
+            qy = y / RF_PANEL;
+            sy = (y % RF_PANEL) * RF_IMG_HW / RF_PANEL;
+        } else {
+            sy = y * RF_IMG_HW / IMG_H;
+        }
+        const uint8_t *src = rf_img + (size_t)sy * RF_IMG_HW * RF_IMG_CH;
         int16_t(*cur)[RF_IMG_CH] = err[y & 1] + 1;
         int16_t(*nxt)[RF_IMG_CH] = err[(y & 1) ^ 1] + 1;
         memset(err[(y & 1) ^ 1], 0, sizeof err[0]);
@@ -398,7 +571,22 @@ void rf_vga_dither(void) {
         uint32_t *r = fb_row(y);
         row_frame(r);
         for (int i = 0; i < IMG_W; i++, x += dir) {
-            const uint8_t *s = src + (size_t)(x / 3) * RF_IMG_CH;
+            uint8_t px[RF_IMG_CH];
+            if (grid) {
+                /* the seam pixel is whichever side of it we reach first */
+                if (x == (dir > 0 ? RF_PANEL : RF_PANEL - 1))
+                    memset(cur[x], 0, sizeof cur[x]);
+                int qx = x / RF_PANEL;
+                rf_color_grid_map(qy * 2 + qx,
+                              src + (size_t)((x % RF_PANEL) * RF_IMG_HW /
+                                             RF_PANEL) *
+                                        RF_IMG_CH,
+                              px);
+            } else {
+                memcpy(px, src + (size_t)(x * RF_IMG_HW / IMG_W) * RF_IMG_CH,
+                       RF_IMG_CH);
+            }
+            const uint8_t *s = px;
             uint8_t q[RF_IMG_CH];
             for (int c = 0; c < RF_IMG_CH; c++) {
                 /* blue gets 2 bits, red and green 3 (RGB332) */
